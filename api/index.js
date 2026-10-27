@@ -1,4 +1,4 @@
-// Unofficial API untuk mirainime.com (metadata + URL sumber video)
+// Unofficial API: katalog mirainime.com + Oploverz & Otakudesu (streaming via API Sanka Vollerei)
 // Jalankan: npm i express cheerio && node server.js
 const express = require("express");
 const cheerio = require("cheerio");
@@ -146,7 +146,7 @@ const wrap = (fn) => async (req, res) => {
 
 app.get("/", (_, res) =>
   res.json({
-    endpoints: [
+    mirainime_katalog: [
       "/home",
       "/ongoing",
       "/upcoming",
@@ -156,7 +156,29 @@ app.get("/", (_, res) =>
       "/genre/:name",
       "/anime/:slug",
       "/anime/:slug/episode/:n",
-      "/anime/:slug/episode/:n/stream?q=720",
+    ],
+    oploverz: [
+      "/oploverz/home?page=1",
+      "/oploverz/schedule",
+      "/oploverz/ongoing?page=1",
+      "/oploverz/completed?page=1",
+      "/oploverz/list?page=1&status=&type=&order=",
+      "/oploverz/search/:query",
+      "/oploverz/anime/:slug",
+      "/oploverz/episode/:slug",
+    ],
+    otakudesu: [
+      "/otakudesu/home",
+      "/otakudesu/schedule",
+      "/otakudesu/ongoing?page=1",
+      "/otakudesu/completed?page=1",
+      "/otakudesu/genre",
+      "/otakudesu/genre/:slug?page=1",
+      "/otakudesu/search/:keyword",
+      "/otakudesu/anime/:slug",
+      "/otakudesu/episode/:slug",
+      "/otakudesu/batch/:slug",
+      "/otakudesu/server/:serverId",
     ],
   })
 );
@@ -266,112 +288,114 @@ app.get("/anime/:slug", wrap(async (req) => {
   };
 }));
 
-// ---- Sumber video ----
-// URL video ada di HTML halaman episode (JSON-LD: contentUrl/embedUrl). URL-nya bertanda tangan
-// (ada parameter file & expiry), jadi diambil baru setiap request dan tidak boleh di-cache lama.
-function parseVideo(html, $) {
-  const found = new Map();
-  const add = (raw, via) => {
-    if (!raw) return;
-    let u = String(raw).replace(/\\u0026/g, "&").replace(/&amp;/g, "&").replace(/\\\//g, "/");
-    try {
-      u = new URL(u, BASE).href;
-    } catch {
-      return;
-    }
-    if (!/^https?:/i.test(u)) return;
-    if (!found.has(u)) found.set(u, via);
-  };
-
-  // 1) JSON-LD (bisa berupa objek, array, atau @graph)
-  $('script[type="application/ld+json"]').each((_, el) => {
-    let data;
-    try {
-      data = JSON.parse($(el).contents().text());
-    } catch {
-      return;
-    }
-    const walk = (n) => {
-      if (!n || typeof n !== "object") return;
-      if (Array.isArray(n)) return n.forEach(walk);
-      if (typeof n.contentUrl === "string") add(n.contentUrl, "jsonld");
-      if (typeof n.embedUrl === "string") add(n.embedUrl, "jsonld");
-      Object.values(n).forEach(walk);
-    };
-    walk(data);
-  });
-
-  // 2) cadangan: link .mp4 / .m3u8 yang tertulis langsung di HTML
-  const flat = html.replace(/\\u0026/g, "&").replace(/\\\//g, "/");
-  for (const m of flat.matchAll(/https?:\/\/[^"'\s<>\\]+\.(?:mp4|m3u8)[^"'\s<>\\]*/gi)) add(m[0], "html");
-
-  // Hanya file video; satu entri per server + path (tanda tangan URL berbeda tiap kemunculan)
-  const seen = new Set();
-  const list = [];
-  for (const [url, via] of found) {
-    const u = new URL(url);
-    if (!/\.(mp4|m3u8|webm)$/i.test(u.pathname)) continue;
-    const key = u.host + u.pathname;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const q = u.pathname.match(/(\d{3,4})p\b/i);
-    list.push({
-      url,
-      type: /\.m3u8$/i.test(u.pathname) ? "hls" : "mp4",
-      quality: q ? q[1] + "p" : null,
-      server: u.host,
-      via,
-    });
-  }
-  // HLS dulu, lalu mp4 dari kualitas tertinggi
-  return list.sort((a, b) => (a.type === "hls" ? -1 : 0) - (b.type === "hls" ? -1 : 0) || (parseInt(b.quality) || 0) - (parseInt(a.quality) || 0));
-}
-
-async function getEpisode(slug, n) {
-  const $ = cheerio.load(await getHtml(`/anime/${encodeURIComponent(slug)}/episode/${encodeURIComponent(n)}`, true));
-  const html = $.html();
+// ---- Mirainime: detail episode (metadata saja) ----
+// File video Mirainime diproteksi server videonya (Cloudflare), jadi tidak diteruskan ke pemutar.
+// Tonton lewat Oploverz / Otakudesu di bawah, atau buka `url` halaman episodenya.
+app.get("/anime/:slug/episode/:n", wrap(async (req) => {
+  const { slug, n } = req.params;
+  const $ = cheerio.load(await getHtml(`/anime/${encodeURIComponent(slug)}/episode/${encodeURIComponent(n)}`));
   const num = Number(n);
   const nums = [...new Set(parseEpisodes($).filter((e) => e.anime === slug).map((e) => e.number))];
-  const prev = nums.filter((x) => x < num).sort((a, b) => b - a)[0] ?? null;
-  const next = nums.filter((x) => x > num).sort((a, b) => a - b)[0] ?? null;
   const metaTitle = $('meta[property="og:title"]').attr("content") || $("title").first().text();
   return {
     title: $("h1").first().text().trim() || (metaTitle || "").replace(/\s+/g, " ").trim(),
     anime: slug,
     episode: num,
     url: `${BASE}/anime/${slug}/episode/${n}`,
-    videos: parseVideo(html, $),
-    prevEpisode: prev,
-    nextEpisode: next,
-    fetchedAt: new Date().toISOString(),
+    prevEpisode: nums.filter((x) => x < num).sort((a, b) => b - a)[0] ?? null,
+    nextEpisode: nums.filter((x) => x > num).sort((a, b) => a - b)[0] ?? null,
   };
+}));
+
+// ---- Oploverz & Otakudesu lewat API publik Sanka Vollerei ----
+// Dokumentasi: https://www.sankavollerei.web.id/anime  (batas 45 request/menit, pelanggar bisa di-ban)
+// Respons dari sana diteruskan apa adanya di field `data`; bentuknya ditentukan mereka.
+const UP_BASE = "https://www.sankavollerei.web.id/anime";
+const UP_MAX_PER_MIN = 35; // di bawah batas 45/menit mereka (hitungan per instance serverless)
+const TTL_LIST = 5 * 60 * 1000;
+const TTL_STREAM = 60 * 1000; // link streaming/server: jangan disimpan lama
+const upCache = new Map();
+let upCalls = [];
+
+const httpError = (status, message, retryAfter) => Object.assign(new Error(message), { status, retryAfter });
+
+async function upstream(path, query = {}, ttl = TTL_LIST) {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(query)) if (typeof v === "string" && v.length <= 100) qs.set(k, v);
+  const q = qs.toString();
+  const url = UP_BASE + path + (q ? "?" + q : "");
+
+  const hit = upCache.get(url);
+  if (hit && Date.now() - hit.t < hit.ttl) return hit.data;
+
+  const now = Date.now();
+  upCalls = upCalls.filter((t) => now - t < 60000);
+  if (upCalls.length >= UP_MAX_PER_MIN) throw httpError(429, "Server sumber sedang sibuk, coba lagi sebentar", 30);
+  upCalls.push(now);
+
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; UnofficialAPI/1.0)", Accept: "application/json" },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (e) {
+    throw httpError(504, "Server sumber tidak merespons");
+  }
+  if (res.status === 429) throw httpError(429, "Kena batas request dari server sumber, coba lagi sebentar", 60);
+  if (res.status === 404) throw httpError(404, "Data tidak ditemukan di server sumber");
+  if (!res.ok) throw httpError(502, `Server sumber membalas ${res.status}`);
+
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw httpError(502, "Respons server sumber bukan JSON");
+  }
+  if (upCache.size > 300) upCache.delete(upCache.keys().next().value);
+  upCache.set(url, { data, t: Date.now(), ttl });
+  return data;
 }
 
-// URL video bertanda tangan: jangan di-cache di edge Vercel
-const noStore = (res) => res.set("Cache-Control", "no-store");
+const seg = (v) => encodeURIComponent(String(v).slice(0, 200));
+const pick = (q, keys) => Object.fromEntries(keys.filter((k) => typeof q[k] === "string").map((k) => [k, q[k]]));
 
-app.get("/anime/:slug/episode/:n", (req, res, next) => {
-  noStore(res);
-  wrap(async () => getEpisode(req.params.slug, req.params.n))(req, res, next);
-});
-
-// Alihkan ke file video supaya bisa dipakai langsung: <video src=".../anime/:slug/episode/:n/stream?q=720">
-// Browser mengunduh videonya dari server sumber, bukan lewat Vercel.
-app.get("/anime/:slug/episode/:n/stream", async (req, res) => {
-  noStore(res);
+// build(req) -> { path, query }
+const proxy = (build, ttl = TTL_LIST) => async (req, res) => {
   try {
-    const ep = await getEpisode(req.params.slug, req.params.n);
-    const want = String(req.query.q || "").replace(/\D/g, "");
-    const pick =
-      (want && ep.videos.find((v) => v.quality === want + "p")) ||
-      ep.videos.find((v) => v.type === "mp4") ||
-      ep.videos[0];
-    if (!pick) return res.status(404).json({ ok: false, error: "Sumber video tidak ditemukan di halaman episode" });
-    res.redirect(302, pick.url);
+    const { path, query } = build(req);
+    const data = await upstream(path, query, ttl);
+    if (ttl <= TTL_STREAM) res.set("Cache-Control", "public, s-maxage=30, stale-while-revalidate=60");
+    res.json({ ok: true, source: "sankavollerei", data });
   } catch (e) {
-    res.status(502).json({ ok: false, error: e.message });
+    res.set("Cache-Control", "no-store");
+    if (e.retryAfter) res.set("Retry-After", String(e.retryAfter));
+    res.status(e.status || 502).json({ ok: false, error: e.message });
   }
-});
+};
+
+// Oploverz
+app.get("/oploverz/home", proxy((r) => ({ path: "/oploverz/home", query: pick(r.query, ["page"]) })));
+app.get("/oploverz/schedule", proxy(() => ({ path: "/oploverz/schedule", query: {} })));
+app.get("/oploverz/ongoing", proxy((r) => ({ path: "/oploverz/ongoing", query: pick(r.query, ["page"]) })));
+app.get("/oploverz/completed", proxy((r) => ({ path: "/oploverz/completed", query: pick(r.query, ["page"]) })));
+app.get("/oploverz/list", proxy((r) => ({ path: "/oploverz/list", query: pick(r.query, ["page", "status", "type", "order", "genre"]) })));
+app.get("/oploverz/search/:query", proxy((r) => ({ path: `/oploverz/search/${seg(r.params.query)}`, query: {} })));
+app.get("/oploverz/anime/:slug", proxy((r) => ({ path: `/oploverz/anime/${seg(r.params.slug)}`, query: {} })));
+app.get("/oploverz/episode/:slug", proxy((r) => ({ path: `/oploverz/episode/${seg(r.params.slug)}`, query: {} }), TTL_STREAM));
+
+// Otakudesu
+app.get("/otakudesu/home", proxy(() => ({ path: "/home", query: {} })));
+app.get("/otakudesu/schedule", proxy(() => ({ path: "/schedule", query: {} })));
+app.get("/otakudesu/ongoing", proxy((r) => ({ path: "/ongoing-anime", query: pick(r.query, ["page"]) })));
+app.get("/otakudesu/completed", proxy((r) => ({ path: "/complete-anime", query: pick(r.query, ["page"]) })));
+app.get("/otakudesu/genre", proxy(() => ({ path: "/genre", query: {} })));
+app.get("/otakudesu/genre/:slug", proxy((r) => ({ path: `/genre/${seg(r.params.slug)}`, query: pick(r.query, ["page"]) })));
+app.get("/otakudesu/search/:keyword", proxy((r) => ({ path: `/search/${seg(r.params.keyword)}`, query: {} })));
+app.get("/otakudesu/anime/:slug", proxy((r) => ({ path: `/anime/${seg(r.params.slug)}`, query: {} })));
+app.get("/otakudesu/episode/:slug", proxy((r) => ({ path: `/episode/${seg(r.params.slug)}`, query: {} }), TTL_STREAM));
+app.get("/otakudesu/batch/:slug", proxy((r) => ({ path: `/batch/${seg(r.params.slug)}`, query: {} })));
+app.get("/otakudesu/server/:serverId", proxy((r) => ({ path: `/server/${seg(r.params.serverId)}`, query: {} }), TTL_STREAM));
 
 app.use((req, res) =>
   res.status(404).json({ ok: false, error: `Route tidak ada: ${req.path}`, see: "/" })
