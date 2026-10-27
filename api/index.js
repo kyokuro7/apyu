@@ -7,6 +7,34 @@ const BASE = "https://mirainime.com";
 const app = express();
 const cache = new Map();
 
+// Rate limit sederhana per IP: 60 request/menit.
+// Catatan: hitungannya per instance serverless, jadi ini pengaman dasar saja.
+const hits = new Map();
+const LIMIT = 60;
+const WINDOW = 60 * 1000;
+app.use((req, res, next) => {
+  const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown")
+    .split(",")[0]
+    .trim();
+  const now = Date.now();
+  let h = hits.get(ip);
+  if (!h || now > h.reset) {
+    h = { n: 0, reset: now + WINDOW };
+    hits.set(ip, h);
+  }
+  h.n++;
+  if (hits.size > 5000) for (const [k, v] of hits) if (now > v.reset) hits.delete(k);
+
+  res.set("X-RateLimit-Limit", String(LIMIT));
+  res.set("X-RateLimit-Remaining", String(Math.max(0, LIMIT - h.n)));
+  if (h.n > LIMIT) {
+    res.set("Retry-After", String(Math.ceil((h.reset - now) / 1000)));
+    res.set("Cache-Control", "no-store");
+    return res.status(429).json({ ok: false, error: "Terlalu banyak request, coba lagi sebentar" });
+  }
+  next();
+});
+
 // Biar edge cache Vercel yang menyimpan hasilnya (cache in-memory tidak awet di serverless)
 app.use((req, res, next) => {
   res.set("Cache-Control", "public, s-maxage=300, stale-while-revalidate=600");
@@ -31,26 +59,59 @@ async function getHtml(path) {
 const abs = (u) => (u ? new URL(u, BASE).href : null);
 const slugOf = (href) => (href.match(/\/anime\/([^/?#]+)/) || [])[1];
 
+// Info tambahan dari teks kartu: skor, nomor episode, tipe
+function cardInfo(text) {
+  const t = text.replace(/\s+/g, " ");
+  const score = t.match(/[★⭐]\s*(\d+(?:\.\d+)?)/);
+  const ep = t.match(/\bEP\s*(\d+)/i) || t.match(/(\d+)\s*EP\b/i);
+  const type = t.match(/\b(TV|ONA|OVA|Movie|Special)\b/);
+  return {
+    score: score ? Number(score[1]) : null,
+    episode: ep ? Number(ep[1]) : null,
+    type: type ? type[1] : null,
+  };
+}
+
 // Ambil kartu anime dari link /anime/{slug} (tanpa /episode/)
 function parseAnimeLinks($) {
-  const seen = new Set();
-  const out = [];
+  const bySlug = new Map();
   $('a[href*="/anime/"]').each((_, el) => {
     const href = $(el).attr("href") || "";
     if (href.includes("/episode/")) return;
     const slug = slugOf(href);
-    if (!slug || seen.has(slug)) return;
+    if (!slug) return;
     const title = $(el).find("img").attr("alt") || $(el).text().trim();
     if (!title) return;
-    seen.add(slug);
-    out.push({
+    const info = cardInfo($(el).text());
+    const prev = bySlug.get(slug);
+    if (prev) {
+      // link kedua untuk anime yang sama: isi field yang masih kosong
+      for (const k of Object.keys(info)) if (prev[k] == null) prev[k] = info[k];
+      if (!prev.poster) prev.poster = abs($(el).find("img").attr("src"));
+      return;
+    }
+    bySlug.set(slug, {
       slug,
       title: title.replace(/\s+/g, " ").slice(0, 150),
       poster: abs($(el).find("img").attr("src")),
+      ...info,
       url: abs(href),
     });
   });
-  return out;
+  return [...bySlug.values()];
+}
+
+// Filter opsional: ?type=TV  ?max_ep=13  ?min_score=7 (field kosong tidak dibuang)
+function applyFilters(list, q) {
+  const type = q.type && String(q.type).toLowerCase();
+  const maxEp = q.max_ep && Number(q.max_ep);
+  const minScore = q.min_score && Number(q.min_score);
+  return list.filter(
+    (a) =>
+      (!type || !a.type || a.type.toLowerCase() === type) &&
+      (!maxEp || a.episode == null || a.episode <= maxEp) &&
+      (!minScore || a.score == null || a.score >= minScore)
+  );
 }
 
 // Ambil episode dari link /anime/{slug}/episode/{n}
@@ -104,13 +165,46 @@ app.get("/home", wrap(async () => {
   return { latestEpisodes: parseEpisodes($), anime: parseAnimeLinks($) };
 }));
 
-app.get("/ongoing", wrap(async () => parseAnimeLinks(cheerio.load(await getHtml("/ongoing")))));
+app.get("/ongoing", wrap(async (req) => applyFilters(parseAnimeLinks(cheerio.load(await getHtml("/ongoing"))), req.query)));
 app.get("/upcoming", wrap(async () => parseAnimeLinks(cheerio.load(await getHtml("/upcoming")))));
-app.get("/schedule", wrap(async () => parseAnimeLinks(cheerio.load(await getHtml("/jadwal-tayang-anime")))));
+const DAYS = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"];
+
+function parseSchedule($) {
+  const out = Object.fromEntries(DAYS.map((d) => [d, []]));
+  const seen = new Set();
+  $('a[href*="/anime/"]').each((_, el) => {
+    const href = $(el).attr("href") || "";
+    if (href.includes("/episode/")) return;
+    const slug = slugOf(href);
+    const text = $(el).text().replace(/\s+/g, " ").trim();
+    const time = text.match(/\b([01]\d|2[0-3]):[0-5]\d\b/);
+    const day = text.match(new RegExp(DAYS.join("|")));
+    if (!slug || !time || !day || seen.has(slug + day[0])) return;
+    seen.add(slug + day[0]);
+    out[day[0]].push({
+      slug,
+      title: ($(el).find("img").attr("alt") || text.split(time[0])[0]).trim(),
+      poster: abs($(el).find("img").attr("src")),
+      time: time[0],
+      ...cardInfo(text),
+      url: abs(href),
+    });
+  });
+  for (const d of DAYS) out[d].sort((a, b) => a.time.localeCompare(b.time));
+  return out;
+}
+
+// /schedule  atau  /schedule?day=selasa
+app.get("/schedule", wrap(async (req) => {
+  let sched = parseSchedule(cheerio.load(await getHtml("/jadwal-tayang-anime")));
+  if (!DAYS.some((d) => sched[d].length)) sched = parseSchedule(cheerio.load(await getHtml("/")));
+  const want = DAYS.find((d) => d.toLowerCase() === String(req.query.day || "").toLowerCase());
+  return want ? { [want]: sched[want] } : sched;
+}));
 
 app.get("/search", wrap(async (req) => {
   const q = encodeURIComponent(req.query.q || "");
-  return parseAnimeLinks(cheerio.load(await getHtml(`/search?q=${q}`)));
+  return applyFilters(parseAnimeLinks(cheerio.load(await getHtml(`/search?q=${q}`))), req.query);
 }));
 
 app.get("/genre/:name", wrap(async (req) =>
@@ -180,21 +274,6 @@ app.get("/anime/:slug/episode/:n", wrap(async (req) => {
     url: `${BASE}/anime/${req.params.slug}/episode/${req.params.n}`,
   };
 }));
-
-// Bantuan debug: /debug?path=/anime/one-piece&q=kata -> potongan HTML di sekitar kata itu
-app.get("/debug", async (req, res) => {
-  try {
-    const path = String(req.query.path || "/");
-    if (!path.startsWith("/")) return res.status(400).type("text").send("path harus diawali /");
-    const html = await getHtml(path);
-    const q = String(req.query.q || "");
-    const i = q ? html.indexOf(q) : 0;
-    if (i < 0) return res.status(404).type("text").send("kata tidak ditemukan");
-    res.type("text").send(html.slice(Math.max(0, i - 500), i + 1200));
-  } catch (e) {
-    res.status(502).type("text").send(e.message);
-  }
-});
 
 app.use((req, res) =>
   res.status(404).json({ ok: false, error: `Route tidak ada: ${req.path}`, see: "/" })
