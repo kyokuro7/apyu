@@ -55,21 +55,24 @@ function parseAnimeLinks($) {
 
 // Ambil episode dari link /anime/{slug}/episode/{n}
 function parseEpisodes($) {
-  const seen = new Set();
-  const out = [];
+  const byHref = new Map();
   $('a[href*="/episode/"]').each((_, el) => {
     const href = $(el).attr("href") || "";
     const m = href.match(/\/anime\/([^/]+)\/episode\/(\d+)/);
-    if (!m || seen.has(href)) return;
-    seen.add(href);
-    out.push({
-      anime: m[1],
-      episode: Number(m[2]),
-      text: $(el).text().replace(/\s+/g, " ").trim().slice(0, 200),
-      url: abs(href),
-    });
+    if (!m) return;
+    const text = $(el).text().replace(/\s+/g, " ").trim();
+    const prev = byHref.get(href);
+    if (!prev || text.length > prev.text.length) {
+      byHref.set(href, { anime: m[1], number: Number(m[2]), text, href });
+    }
   });
-  return out;
+  return [...byHref.values()].map((e) => ({
+    anime: e.anime,
+    number: e.number,
+    title: (e.text.match(/EP\d+\s*-\s*(.+?)\s*(?:Subtitle|Sub)\s*Indo/i) || [])[1] || null,
+    date: (e.text.match(/•\s*(.+)$/) || [])[1] || null,
+    url: abs(e.href),
+  }));
 }
 
 const wrap = (fn) => async (req, res) => {
@@ -146,12 +149,21 @@ app.get("/anime/:slug", wrap(async (req) => {
   });
 
   const meta = (n) => $(`meta[property="${n}"]`).attr("content") || $(`meta[name="${n}"]`).attr("content") || null;
-  const title = $("h1").first().text().trim() || (meta("og:title") || "").split(" - ")[0] || null;
+  const rawTitle = $("h1").first().text().trim() || (meta("og:title") || "").split(" - ")[0] || "";
+  const title = rawTitle.replace(/\s*(?:Sub(?:title)?\s*Indo.*|:\s*Episode.*|Episode\s*\d+.*)$/i, "").trim() || null;
+
+  // Sinopsis = paragraf terpanjang yang bukan teks SEO
+  const seo = /nonton|streaming|download|subtitle indonesia|batch/i;
+  let synopsis = null;
+  $("p").each((_, el) => {
+    const t = $(el).text().replace(/\s+/g, " ").trim();
+    if (t.length > 60 && !seo.test(t) && (!synopsis || t.length > synopsis.length)) synopsis = t;
+  });
 
   return {
     slug: req.params.slug,
     title,
-    synopsis: meta("og:description") || meta("description"),
+    synopsis: synopsis || meta("og:description") || meta("description"),
     poster: abs(meta("og:image")),
     genres: [...genres],
     episodes: parseEpisodes($),
@@ -167,6 +179,21 @@ app.get("/anime/:slug/episode/:n", wrap(async (req) => {
     url: `${BASE}/anime/${req.params.slug}/episode/${req.params.n}`,
   };
 }));
+
+// Bantuan debug: /debug?path=/anime/one-piece&q=kata -> potongan HTML di sekitar kata itu
+app.get("/debug", async (req, res) => {
+  try {
+    const path = String(req.query.path || "/");
+    if (!path.startsWith("/")) return res.status(400).type("text").send("path harus diawali /");
+    const html = await getHtml(path);
+    const q = String(req.query.q || "");
+    const i = q ? html.indexOf(q) : 0;
+    if (i < 0) return res.status(404).type("text").send("kata tidak ditemukan");
+    res.type("text").send(html.slice(Math.max(0, i - 500), i + 1200));
+  } catch (e) {
+    res.status(502).type("text").send(e.message);
+  }
+});
 
 app.use((req, res) =>
   res.status(404).json({ ok: false, error: `Route tidak ada: ${req.path}`, see: "/" })
