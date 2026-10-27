@@ -22,7 +22,7 @@ async function getHtml(path) {
   const res = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0 (compatible; UnofficialAPI/1.0)" },
   });
-  if (!res.ok) throw new Error(`Upstream ${res.status}`);
+  if (!res.ok) throw new Error(`Upstream ${res.status} untuk ${url}`);
   const html = await res.text();
   cache.set(url, { html, t: Date.now() });
   return html;
@@ -87,6 +87,7 @@ app.get("/", (_, res) =>
       "/ongoing",
       "/upcoming",
       "/schedule",
+      "/anime?page=1",
       "/search?q=",
       "/genre/:name",
       "/anime/:slug",
@@ -113,14 +114,46 @@ app.get("/genre/:name", wrap(async (req) =>
   parseAnimeLinks(cheerio.load(await getHtml(`/genre/${encodeURIComponent(req.params.name)}`)))
 ));
 
+const animeList = wrap(async (req) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const q = page > 1 ? `?page=${page}` : "";
+  let lastErr;
+  for (const base of ["/anime-list", "/anime"]) {
+    try {
+      const $ = cheerio.load(await getHtml(base + q));
+      const results = parseAnimeLinks($);
+      if (results.length) return { page, source: base, results };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("Daftar anime kosong");
+});
+app.get("/anime", animeList);
+app.get("/anime-list", animeList);
+
 app.get("/anime/:slug", wrap(async (req) => {
   const $ = cheerio.load(await getHtml(`/anime/${encodeURIComponent(req.params.slug)}`));
+
+  // Abaikan menu genre di navigasi (isinya puluhan genre di setiap halaman)
+  const genres = new Set();
+  $('a[href*="/genre/"]').each((_, el) => {
+    let box = $(el).parent();
+    while (box.length && box.find('a[href*="/genre/"]').length < 2) box = box.parent();
+    if (box.find('a[href*="/genre/"]').length > 15) return;
+    const g = $(el).text().trim();
+    if (g) genres.add(g);
+  });
+
+  const meta = (n) => $(`meta[property="${n}"]`).attr("content") || $(`meta[name="${n}"]`).attr("content") || null;
+  const title = $("h1").first().text().trim() || (meta("og:title") || "").split(" - ")[0] || null;
+
   return {
     slug: req.params.slug,
-    title: $("h1").first().text().trim(),
-    synopsis: $('meta[name="description"]').attr("content") || null,
-    poster: abs($('meta[property="og:image"]').attr("content")),
-    genres: $('a[href*="/genre/"]').map((_, e) => $(e).text().trim()).get(),
+    title,
+    synopsis: meta("og:description") || meta("description"),
+    poster: abs(meta("og:image")),
+    genres: [...genres],
     episodes: parseEpisodes($),
   };
 }));
@@ -134,6 +167,10 @@ app.get("/anime/:slug/episode/:n", wrap(async (req) => {
     url: `${BASE}/anime/${req.params.slug}/episode/${req.params.n}`,
   };
 }));
+
+app.use((req, res) =>
+  res.status(404).json({ ok: false, error: `Route tidak ada: ${req.path}`, see: "/" })
+);
 
 // Jalan lokal: node api/index.js | Di Vercel: diekspor sebagai handler
 if (require.main === module) {
