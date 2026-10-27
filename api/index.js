@@ -1,4 +1,4 @@
-// Unofficial API untuk mirainime.com (metadata saja)
+// Unofficial API untuk mirainime.com (metadata + URL sumber video)
 // Jalankan: npm i express cheerio && node server.js
 const express = require("express");
 const cheerio = require("cheerio");
@@ -42,10 +42,10 @@ app.use((req, res, next) => {
 });
 const TTL = 5 * 60 * 1000; // cache 5 menit supaya tidak membebani situs
 
-async function getHtml(path) {
+async function getHtml(path, fresh = false) {
   const url = path.startsWith("http") ? path : BASE + path;
   const hit = cache.get(url);
-  if (hit && Date.now() - hit.t < TTL) return hit.html;
+  if (!fresh && hit && Date.now() - hit.t < TTL) return hit.html;
 
   const res = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0 (compatible; UnofficialAPI/1.0)" },
@@ -156,6 +156,7 @@ app.get("/", (_, res) =>
       "/genre/:name",
       "/anime/:slug",
       "/anime/:slug/episode/:n",
+      "/anime/:slug/episode/:n/stream?q=720",
     ],
   })
 );
@@ -265,15 +266,102 @@ app.get("/anime/:slug", wrap(async (req) => {
   };
 }));
 
-app.get("/anime/:slug/episode/:n", wrap(async (req) => {
-  const $ = cheerio.load(await getHtml(`/anime/${req.params.slug}/episode/${req.params.n}`));
-  return {
-    title: $("h1").first().text().trim(),
-    anime: req.params.slug,
-    episode: Number(req.params.n),
-    url: `${BASE}/anime/${req.params.slug}/episode/${req.params.n}`,
+// ---- Sumber video ----
+// URL video ada di HTML halaman episode (JSON-LD: contentUrl/embedUrl). URL-nya bertanda tangan
+// (ada parameter file & expiry), jadi diambil baru setiap request dan tidak boleh di-cache lama.
+function parseVideo(html, $) {
+  const found = new Map();
+  const add = (raw, via) => {
+    if (!raw) return;
+    let u = String(raw).replace(/\\u0026/g, "&").replace(/&amp;/g, "&").replace(/\\\//g, "/");
+    try {
+      u = new URL(u, BASE).href;
+    } catch {
+      return;
+    }
+    if (!/^https?:/i.test(u)) return;
+    if (!found.has(u)) found.set(u, via);
   };
-}));
+
+  // 1) JSON-LD (bisa berupa objek, array, atau @graph)
+  $('script[type="application/ld+json"]').each((_, el) => {
+    let data;
+    try {
+      data = JSON.parse($(el).contents().text());
+    } catch {
+      return;
+    }
+    const walk = (n) => {
+      if (!n || typeof n !== "object") return;
+      if (Array.isArray(n)) return n.forEach(walk);
+      if (typeof n.contentUrl === "string") add(n.contentUrl, "jsonld");
+      if (typeof n.embedUrl === "string") add(n.embedUrl, "jsonld");
+      Object.values(n).forEach(walk);
+    };
+    walk(data);
+  });
+
+  // 2) cadangan: link .mp4 / .m3u8 yang tertulis langsung di HTML
+  const flat = html.replace(/\\u0026/g, "&").replace(/\\\//g, "/");
+  for (const m of flat.matchAll(/https?:\/\/[^"'\s<>\\]+\.(?:mp4|m3u8)[^"'\s<>\\]*/gi)) add(m[0], "html");
+
+  return [...found].map(([url, via]) => {
+    const path = url.split("?")[0];
+    const q = path.match(/(\d{3,4})p\b/i);
+    return {
+      url,
+      type: /\.m3u8$/i.test(path) ? "hls" : "mp4",
+      quality: q ? q[1] + "p" : null,
+      via,
+    };
+  });
+}
+
+async function getEpisode(slug, n) {
+  const $ = cheerio.load(await getHtml(`/anime/${encodeURIComponent(slug)}/episode/${encodeURIComponent(n)}`, true));
+  const html = $.html();
+  const num = Number(n);
+  const nums = [...new Set(parseEpisodes($).filter((e) => e.anime === slug).map((e) => e.number))];
+  const prev = nums.filter((x) => x < num).sort((a, b) => b - a)[0] ?? null;
+  const next = nums.filter((x) => x > num).sort((a, b) => a - b)[0] ?? null;
+  const metaTitle = $('meta[property="og:title"]').attr("content") || $("title").first().text();
+  return {
+    title: $("h1").first().text().trim() || (metaTitle || "").replace(/\s+/g, " ").trim(),
+    anime: slug,
+    episode: num,
+    url: `${BASE}/anime/${slug}/episode/${n}`,
+    videos: parseVideo(html, $),
+    prevEpisode: prev,
+    nextEpisode: next,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+// URL video bertanda tangan: jangan di-cache di edge Vercel
+const noStore = (res) => res.set("Cache-Control", "no-store");
+
+app.get("/anime/:slug/episode/:n", (req, res, next) => {
+  noStore(res);
+  wrap(async () => getEpisode(req.params.slug, req.params.n))(req, res, next);
+});
+
+// Alihkan ke file video supaya bisa dipakai langsung: <video src=".../anime/:slug/episode/:n/stream?q=720">
+// Browser mengunduh videonya dari server sumber, bukan lewat Vercel.
+app.get("/anime/:slug/episode/:n/stream", async (req, res) => {
+  noStore(res);
+  try {
+    const ep = await getEpisode(req.params.slug, req.params.n);
+    const want = String(req.query.q || "").replace(/\D/g, "");
+    const pick =
+      (want && ep.videos.find((v) => v.quality === want + "p")) ||
+      ep.videos.find((v) => v.type === "mp4") ||
+      ep.videos[0];
+    if (!pick) return res.status(404).json({ ok: false, error: "Sumber video tidak ditemukan di halaman episode" });
+    res.redirect(302, pick.url);
+  } catch (e) {
+    res.status(502).json({ ok: false, error: e.message });
+  }
+});
 
 app.use((req, res) =>
   res.status(404).json({ ok: false, error: `Route tidak ada: ${req.path}`, see: "/" })
