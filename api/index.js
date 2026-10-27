@@ -157,7 +157,8 @@ app.get("/anime/:slug", wrap(async (req) => {
   let synopsis = null;
   $("p").each((_, el) => {
     const t = $(el).text().replace(/\s+/g, " ").trim();
-    if (t.length > 60 && !seo.test(t) && (!synopsis || t.length > synopsis.length)) synopsis = t;
+    if (synopsis || t.length <= 60 || seo.test(t) || $(el).closest("a").length) return;
+    synopsis = t;
   });
 
   return {
