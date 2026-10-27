@@ -305,16 +305,26 @@ function parseVideo(html, $) {
   const flat = html.replace(/\\u0026/g, "&").replace(/\\\//g, "/");
   for (const m of flat.matchAll(/https?:\/\/[^"'\s<>\\]+\.(?:mp4|m3u8)[^"'\s<>\\]*/gi)) add(m[0], "html");
 
-  return [...found].map(([url, via]) => {
-    const path = url.split("?")[0];
-    const q = path.match(/(\d{3,4})p\b/i);
-    return {
+  // Hanya file video; satu entri per server + path (tanda tangan URL berbeda tiap kemunculan)
+  const seen = new Set();
+  const list = [];
+  for (const [url, via] of found) {
+    const u = new URL(url);
+    if (!/\.(mp4|m3u8|webm)$/i.test(u.pathname)) continue;
+    const key = u.host + u.pathname;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const q = u.pathname.match(/(\d{3,4})p\b/i);
+    list.push({
       url,
-      type: /\.m3u8$/i.test(path) ? "hls" : "mp4",
+      type: /\.m3u8$/i.test(u.pathname) ? "hls" : "mp4",
       quality: q ? q[1] + "p" : null,
+      server: u.host,
       via,
-    };
-  });
+    });
+  }
+  // HLS dulu, lalu mp4 dari kualitas tertinggi
+  return list.sort((a, b) => (a.type === "hls" ? -1 : 0) - (b.type === "hls" ? -1 : 0) || (parseInt(b.quality) || 0) - (parseInt(a.quality) || 0));
 }
 
 async function getEpisode(slug, n) {
